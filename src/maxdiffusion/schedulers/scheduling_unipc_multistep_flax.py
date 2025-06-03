@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import flax
 import jax
 import jax.numpy as jnp
+from functools import partial
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import is_scipy_available
@@ -414,8 +415,13 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
 
         rks_list = []
         D1s_list = []
+        # Prepare for D1s_list's shape: (order-1, *model_output_shape)
+        # If order is 1, this will be 0-length, which is fine for jnp.zeros.
+        D1s_temp = jnp.zeros((jnp.maximum(0, order - 1),) + model_output.shape, dtype=model_output.dtype)
+        rks_temp = jnp.zeros(jnp.maximum(0, order - 1), dtype=h.dtype) # rk will be scalar for scalar h
 
-        for i in range(1, order):
+        def loop(i, init_val):
+            D1s_temp, rks_temp = init_val
             history_idx = (
                 self.config.solver_order - 1 - i
             )  # Correct index for history array
@@ -431,14 +437,20 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
             lambda_si = jnp.log(alpha_si + 1e-10) - jnp.log(sigma_si + 1e-10)
 
             rk = (lambda_si - lambda_s0) / h
-            rks_list.append(rk)
-            D1s_list.append((mi - m0) / rk)
+            # rks_list.append(rk)
+            # D1s_list.append((mi - m0) / rk)
+            rks_temp = rks_temp.at[i-1].set(rk)
+            D1s_temp = D1s_temp.at[i-1].set((mi - m0) / rk)
 
-        rks_list.append(1.0)  # Append the last 1.0 for r_order
-        rks = jnp.stack(rks_list)  # Shape (order,)
+        D1s_temp, rks_temp = jax.lax.fori_loop(1, order,
+                                               loop, (D1s_temp, rks_temp))
 
-        R_list = []
-        b_list = []
+
+        # rks_list.append(1.0)  # Append the last 1.0 for r_order
+        # rks = jnp.stack(rks_list)  # Shape (order,)
+        rks = jnp.stack([rks_temp, jnp.array([1.0])])
+
+### continue from here
 
         hh = -h if self.config.predict_x0 else h
         h_phi_1 = jnp.expm1(hh)
@@ -453,15 +465,23 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         else:
             raise NotImplementedError()
 
-        for i in range(1, order + 1):  # Loop from i=1 to order
-            R_list.append(jnp.power(rks, i - 1))
-            b_list.append(current_h_phi_k * factorial_val / B_h)
+        R_list = jnp.zeros(order)
+        b_list = jnp.zeros(order)
+
+        def loop_body(i, init_val):
+            R_list, b_list = init_val
+            R_list = R_list.at[i-1].set(jnp.power(rks, i - 1))
+            b_list = b_list.at[i-1].set(current_h_phi_k * factorial_val / B_h)
 
             if i < order:  # Update for next iteration (i+1)
                 factorial_val *= i + 1
                 current_h_phi_k = (
                     current_h_phi_k / hh - 1.0 / factorial_val
                 )  # Update for next i
+            return (R_list, b_list)
+        R_list, b_list = jax.lax.fori_loop(1, order + 1,
+                                          loop_body, (R_list, b_list))
+    
 
         R = jnp.stack(R_list)  # Shape (order, order)
         b = jnp.stack(b_list)  # Shape (order,)
@@ -621,24 +641,23 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         if schedule_timesteps is None:
             schedule_timesteps = state.timesteps
 
-        timestep_val = (
-            timestep.item()
-            if isinstance(timestep, jnp.ndarray) and timestep.ndim == 0
-            else timestep
-        )
+        # QUINN!!
+        # timestep_val = (
+        #     timestep.item()
+        #     if isinstance(timestep, jnp.ndarray) and timestep.ndim == 0
+        #     else timestep
+        # )
+        timestep_val = timestep
 
         index_candidates = jnp.where(
             schedule_timesteps == timestep_val, size=1, fill_value=-1
         )[0]
 
-        if index_candidates[0] == -1:  # No match found
-            step_index = len(schedule_timesteps) - 1  # Default to last index
-        elif len(index_candidates) > 1:
-            step_index = index_candidates[
-                1
-            ].item()  # Take the second match (diffusers behavior)
-        else:
-            step_index = index_candidates[0].item()  # Take the first (and only) match
+        step_index = jnp.where(
+            index_candidates[0] == -1,  # No match found
+            len(schedule_timesteps) - 1,    # Default to last index
+            index_candidates[0]
+        )
         return step_index
 
     def _init_step_index(
@@ -651,6 +670,7 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         else:
             return state.replace(step_index=state.begin_index)
 
+    @partial(jax.jit, static_argnums=(0,)) # self is static_argnum=0
     def step(
         self,
         state: UniPCMultistepSchedulerState,
@@ -671,22 +691,31 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
                 "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
             )
         # Ensure timestep is a scalar for indexing/comparison
-        timestep_scalar = (
-            timestep.item()
-            if isinstance(timestep, jnp.ndarray) and timestep.ndim == 0
-            else int(timestep)
-        )  # Ensure int type
+        # QUINN!!
+        # timestep_scalar = (
+        #     timestep.item()
+        #     if isinstance(timestep, jnp.ndarray) and timestep.ndim == 0
+        #     else int(timestep)
+        # )  # Ensure int type
+        timestep_scalar = jnp.array(timestep)
+
 
         # Initialize step_index if it's the first step
         if state.step_index is None:
             state = self._init_step_index(state, timestep_scalar)
 
         # Determine if corrector should be used
+        # QUINN!!
+        # use_corrector = (
+        #     state.step_index > 0
+        #     and state.step_index - 1 not in self.config.disable_corrector
+        #     and state.last_sample
+        #     is not None  # `last_sample` stores output of previous predictor
+        # )
         use_corrector = (
-            state.step_index > 0
-            and state.step_index - 1 not in self.config.disable_corrector
-            and state.last_sample
-            is not None  # `last_sample` stores output of previous predictor
+            (state.step_index > 0) & 
+            (~jnp.isin(state.step_index - 1, jnp.array(self.config.disable_corrector))) & 
+            (state.last_sample is not None)
         )
 
         # Convert model_output (noise/v_pred) to x0_pred or epsilon_pred, based on prediction_type
@@ -695,15 +724,23 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         )
 
         # Apply corrector if applicable
-        if use_corrector:
-            corrected_sample = self.multistep_uni_c_bh_update(
+        # if use_corrector:
+        #     corrected_sample = self.multistep_uni_c_bh_update(
+        #         state=state,
+        #         this_model_output=model_output_for_history,
+        #         last_sample=state.last_sample,
+        #         this_sample=sample,
+        #         order=state.this_order,
+        #     )
+        #     sample = corrected_sample
+
+        sample = jax.lax.cond(use_corrector, self.multistep_uni_c_bh_update(
                 state=state,
                 this_model_output=model_output_for_history,
                 last_sample=state.last_sample,
                 this_sample=sample,
                 order=state.this_order,
-            )
-            sample = corrected_sample
+            ), sample)
 
         # Update history buffers (model_outputs and timestep_list)
         # Shift existing elements to the left and add new one at the end.
@@ -713,14 +750,15 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         # t1:[None,..model_output0,model_output1]
         # ...
         # tn:[model_output0,model_output1,...,model_output_n]
-        if state.step_index == 0:
+        def step_idx0_branch():
             updated_model_outputs_history = state.model_outputs.at[-1].set(
                 model_output_for_history
             )
             updated_timestep_list_history = state.timestep_list.at[-1].set(
                 timestep_scalar
             )
-        else:
+            return updated_model_outputs_history, updated_timestep_list_history
+        def non_step_idx0_branch():
             updated_model_outputs_history = jnp.roll(
                 state.model_outputs, shift=-1, axis=0
             )
@@ -732,19 +770,21 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
             updated_timestep_list_history = updated_timestep_list_history.at[-1].set(
                 timestep_scalar
             )
-
+            return updated_model_outputs_history, updated_timestep_list_history
+        
+        updated_model_outputs_history, updated_timestep_list_history = jax.lax.cond(state.step_index == 0, step_idx0_branch, non_step_idx0_branch)
         state = state.replace(
             model_outputs=updated_model_outputs_history,
             timestep_list=updated_timestep_list_history,
         )
 
         # Determine the order for the current step (warmup phase logic)
-        if self.config.lower_order_final:
-            this_order = jnp.minimum(
+        this_order = jnp.where(
+            self.config.lower_order_final,
+            jnp.minimum(
                 self.config.solver_order, len(state.timesteps) - state.step_index
-            )
-        else:
-            this_order = self.config.solver_order
+            ),
+            self.config.solver_order)
 
         # Warmup for multistep: `this_order` can't exceed `lower_order_nums + 1`
         new_this_order = jnp.minimum(this_order, state.lower_order_nums + 1)
@@ -765,17 +805,16 @@ class FlaxUniPCMultistepScheduler(FlaxSchedulerMixin, ConfigMixin):
         )
 
         # Update lower_order_nums for warmup
-        if state.lower_order_nums < self.config.solver_order:
-            state = state.replace(lower_order_nums=state.lower_order_nums + 1)
-
+        state = jnp.where(state.lower_order_nums < self.config.solver_order, state.replace(lower_order_nums=state.lower_order_nums + 1), state)
         # Upon completion, increase step index by one
         state = state.replace(step_index=state.step_index + 1)
 
         # Return the updated sample and state
-        if not return_dict:
-            return (prev_sample, state)
-
-        return FlaxUniPCMultistepSchedulerOutput(prev_sample=prev_sample, state=state)
+        return jax.lax.cond(
+            return_dict,
+            FlaxUniPCMultistepSchedulerOutput(prev_sample=prev_sample, state=state),
+            (prev_sample, state)
+        )
 
     def scale_model_input(
         self, state: UniPCMultistepSchedulerState, sample: jnp.ndarray, *args, **kwargs
