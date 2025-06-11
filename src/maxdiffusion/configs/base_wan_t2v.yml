@@ -18,21 +18,28 @@ run_name: ''
 metrics_file: "" # for testing, local file that stores scalar metrics. If empty, no metrics are written.
 # If true save metrics such as loss and TFLOPS to GCS in {base_output_directory}/{run_name}/metrics/
 write_metrics: True
-gcs_metrics: True
-
-timing_metrics_file: "" # for testing, local file that stores function timing metrics such as state creation, compilation. If empty, no metrics are written.
-write_timing_metrics: True 
-
+gcs_metrics: False
 # If true save config to GCS in {base_output_directory}/{run_name}/
 save_config_to_gcs: False
-log_period: 10000000000  # Flushes Tensorboard
+log_period: 100
 
-pretrained_model_name_or_path: 'CompVis/stable-diffusion-v1-4'
+pretrained_model_name_or_path: 'Wan-AI/Wan2.1-T2V-14B-Diffusers'
+
+# Flux params
+flux_name: "flux-dev"
+max_sequence_length: 512
+time_shift: True
+base_shift: 0.5
+max_shift: 1.15
+# offloads t5 encoder after text encoding to save memory.
+offload_encoders: True
+
+
 unet_checkpoint: ''
-revision: 'flax'
-
+revision: 'refs/pr/95'
 # This will convert the weights to this dtype.
-weights_dtype: 'float32'
+# When running inference on TPUv5e, use weights_dtype: 'bfloat16'
+weights_dtype: 'bfloat16'
 # This sets the layer's dtype in the model. Ex: nn.Dense(dtype=activations_dtype)
 activations_dtype: 'bfloat16'
 
@@ -47,10 +54,22 @@ precision: "DEFAULT"
 jit_initializers: True
 
 # Set true to load weights from pytorch
-from_pt: False
+from_pt: True
 split_head_dim: True
-attention: 'dot_product' # Supported attention: dot_product, flash
+attention: 'flash' # Supported attention: dot_product, flash, cudnn_flash_te
+
 flash_block_sizes: {}
+# Use the following flash_block_sizes on v6e (Trillium) due to larger vmem.
+# flash_block_sizes: {
+#   "block_q" : 1536,
+#   "block_kv_compute" : 1536,
+#   "block_kv" : 1536,
+#   "block_q_dkv" : 1536,
+#   "block_kv_dkv" : 1536,
+#   "block_kv_dkv_compute" : 1536,
+#   "block_q_dq" : 1536,
+#   "block_kv_dq" : 1536
+# }
 # GroupNorm groups
 norm_num_groups: 32
 
@@ -58,7 +77,7 @@ norm_num_groups: 32
 # else they will be loaded from pretrained_model_name_or_path
 train_new_unet: False
 
-# train text_encoder
+# train text_encoder - Currently not supported for SDXL
 train_text_encoder: False
 text_encoder_learning_rate: 4.25e-6
 
@@ -83,18 +102,19 @@ timestep_bias: {
 
 # Override parameters from checkpoints's scheduler.
 diffusion_scheduler_config: {
-  _class_name: '',
-  # values are v_prediction or leave empty to use scheduler's default.
-  prediction_type: '',
+  _class_name: 'FlaxEulerDiscreteScheduler',
+  prediction_type: 'epsilon',
   rescale_zero_terminal_snr: False,
-  timestep_spacing: ''
+  timestep_spacing: 'trailing'
 }
+
+# Output directory
+# Create a GCS bucket, e.g. my-maxtext-outputs and set this to "gs://my-maxtext-outputs/"
+base_output_directory: ""
 
 # Hardware
 hardware: 'tpu' # Supported hardware types are 'tpu', 'gpu'
 skip_jax_distributed_system: False
-
-base_output_directory: ""
 
 # Parallelism
 mesh_axes: ['data', 'fsdp', 'tensor']
@@ -116,6 +136,7 @@ logical_axis_rules: [
                       ['activation_batch', ['data','fsdp']],
                       ['activation_heads', 'tensor'],
                       ['activation_kv', 'tensor'],
+                      ['mlp','tensor'],
                       ['embed','fsdp'],
                       ['heads', 'tensor'],
                       ['conv_batch', ['data','fsdp']],
@@ -128,10 +149,10 @@ data_sharding: [['data', 'fsdp', 'tensor']]
 # value to auto-shard based on available slices and devices.
 # By default, product of the DCN axes should equal number of slices
 # and product of the ICI axes should equal number of devices per slice.
-dcn_data_parallelism: -1  # recommended DCN axis to be auto-sharded
-dcn_fsdp_parallelism: 1
+dcn_data_parallelism: 1  # recommended DCN axis to be auto-sharded
+dcn_fsdp_parallelism: -1
 dcn_tensor_parallelism: 1
-ici_data_parallelism: -1 # recommended ICI axis to be auto-sharded for TPUv5e
+ici_data_parallelism: -1
 ici_fsdp_parallelism: 1  # recommended ICI axis to be auto-sharded
 ici_tensor_parallelism: 1
 
@@ -146,7 +167,7 @@ cache_latents_text_encoder_outputs: True
 # prepare image latents and text encoder outputs
 # Reduce memory consumption and reduce step time during training
 # transformed dataset is saved at dataset_save_location
-dataset_save_location: '/tmp/pokemon-gpt4-captions_sd15'
+dataset_save_location: '/tmp/pokemon-gpt4-captions_xl'
 train_data_dir: ''
 dataset_config_name: ''
 jax_cache_dir: ''
@@ -155,7 +176,7 @@ hf_train_files: ''
 hf_access_token: ''
 image_column: 'image'
 caption_column: 'text'
-resolution: 512
+resolution: 1024
 center_crop: False
 random_flip: False
 # If cache_latents_text_encoder_outputs is True
@@ -171,15 +192,14 @@ checkpoint_every: -1
 enable_single_replica_ckpt_restoring: False
 
 # Training loop
-learning_rate: 1.e-7
+learning_rate: 4.e-7
 scale_lr: False
 max_train_samples: -1
 # max_train_steps takes priority over num_train_epochs.
-max_train_steps: 800
+max_train_steps: 200
+num_train_epochs: 1
 seed: 0
-# Output directory
-# Create a GCS bucket, e.g. my-maxdiffusion-outputs and set this to "gs://my-maxdiffusion-outputs/"
-output_dir: ''
+output_dir: 'sdxl-model-finetuned'
 per_device_batch_size: 1
 
 warmup_steps_fraction: 0.0
@@ -198,35 +218,53 @@ max_grad_norm: 1.0
 enable_profiler: False
 # Skip first n steps for profiling, to omit things like compilation and to give
 # the iteration time a chance to stabilize.
-skip_first_n_steps_for_profiler: 1
-profiler_steps: 5
+skip_first_n_steps_for_profiler: 5
+profiler_steps: 10
 
 # Generation parameters
 prompt: "A magical castle in the middle of a forest, artistic drawing"
+prompt_2: "A magical castle in the middle of a forest, artistic drawing"
 negative_prompt: "purple, red"
-guidance_scale: 7.5
+do_classifier_free_guidance: True
+guidance_scale: 3.5
 # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
 guidance_rescale: 0.0
-num_inference_steps: 30
+num_inference_steps: 50
+
+# SDXL Lightning parameters
+lightning_from_pt: True
+# Empty or "ByteDance/SDXL-Lightning" to enable lightning.
+lightning_repo: ""
+# Empty or "sdxl_lightning_4step_unet.safetensors" to enable lightning.
+lightning_ckpt: ""
+
+# LoRA parameters
+# Values are lists to support multiple LoRA loading during inference in the future.
+lora_config: {
+  lora_model_name_or_path: [],
+  weight_name: [],
+  adapter_name: [],
+  scale: [],
+  from_pt: []
+}
+# Ex with values:
+# lora_config : {
+#   lora_model_name_or_path: ["ByteDance/Hyper-SD"],
+#   weight_name: ["Hyper-SDXL-2steps-lora.safetensors"],
+#   adapter_name: ["hyper-sdxl"],
+#   scale: [0.7],
+#   from_pt: [True]
+# }
 
 enable_mllog: False
 
-# controlnet
-controlnet_model_name_or_path: 'lllyasviel/sd-controlnet-canny'
+#controlnet
+controlnet_model_name_or_path: 'diffusers/controlnet-canny-sdxl-1.0'
 controlnet_from_pt: True
-controlnet_conditioning_scale: 1.0
-controlnet_image: 'https://huggingface.co/datasets/YiYiXu/test-doc-assets/resolve/main/blog_post_cell_10_output_0.jpeg'
-
-# dreambooth - this script always uses prior preservation.
-instance_data_dir: ''
-class_data_dir: ''
-instance_prompt: ''
-class_prompt: ''
-prior_loss_weight: 1.0
-num_class_images: 100
-# If true, set dataset_save_location.
-cache_dreambooth_dataset: False
+controlnet_conditioning_scale: 0.5
+controlnet_image: 'https://upload.wikimedia.org/wikipedia/commons/thumb/c/c1/Google_%22G%22_logo.svg/1024px-Google_%22G%22_logo.svg.png'
 quantization: ''
 # Shard the range finding operation for quantization. By default this is set to number of slices.
 quantization_local_shard_count: -1
 compile_topology_num_slices: -1 # Number of target slices, set to a positive integer.
+
