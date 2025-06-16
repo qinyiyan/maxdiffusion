@@ -149,7 +149,7 @@ class WanPipeline:
     scheduler_state: UniPCMultistepSchedulerState,
     devices_array: np.array,
     mesh: Mesh,
-    config: HyperParameters
+    config: HyperParameters,
     teacache_coefficients: Optional[jnp.array] = None,
 
   ):
@@ -382,7 +382,7 @@ class WanPipeline:
     vae_only: bool = False,
     slg_layers: List[int] = None,
     slg_start: float = 0.0,
-    slg_end: float = 1.0
+    slg_end: float = 1.0,
     # TeaCache parameters
     enable_teacache: bool = False,
     teacache_thresh: float = 0.0,
@@ -516,7 +516,7 @@ def run_inference(
   # TeaCache parameters
   enable_teacache: bool = False,
   teacache_thresh: float = 0.0, # Now acts as a global multiplier for coefficients or fallback
-  use_ref_steps: bool = False,
+  use_ret_steps: bool = False,
   ret_steps: int = 0, # Max skip steps
   cutoff_steps: int = 0, # How many steps to apply the caching, corresponds to num_steps in PT
   teacache_coefficients: Optional[jnp.array] = None,
@@ -579,8 +579,8 @@ def run_inference(
           alpha_t_current = scheduler_state.alpha_t[step]
           sigma_t_current = scheduler_state.sigma_t[step]
           e0_for_decision = (latents - sigma_t_current * noise_pred_for_decision) / alpha_t_current
-          
-          modulated_inp = e0_for_decision if use_ref_steps else noise_pred_for_decision
+
+          modulated_inp = e0_for_decision if use_ret_steps else noise_pred_for_decision
 
           # --- TeaCache Decision Logic ---
           if cnt % 2 == 0:  # even -> condition
