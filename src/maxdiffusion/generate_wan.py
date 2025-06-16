@@ -30,6 +30,14 @@ def run(config):
   slg_start = config.slg_start
   slg_end = config.slg_end
   
+
+  # TeaCache parameters
+  enable_teacache = config.enable_teacache
+  teacache_thresh = config.teacache_thresh
+  use_ret_steps = config.use_ret_steps
+  ret_steps = config.ret_steps
+  cutoff_steps = config.cutoff_steps
+
   videos = pipeline(
     prompt=config.prompt,
     negative_prompt=config.negative_prompt,
@@ -40,7 +48,13 @@ def run(config):
     guidance_scale=config.guidance_scale,
     slg_layers=slg_layers,
     slg_start=slg_start,
-    slg_end=slg_end
+    slg_end=slg_end,
+    # TeaCache parameters
+    enable_teacache=enable_teacache,
+    teacache_thresh=teacache_thresh,
+    use_ret_steps=use_ret_steps,
+    ret_steps=ret_steps,
+    cutoff_steps=cutoff_steps,
   )
 
   print("compile time: ", (time.perf_counter() - s0))
@@ -58,7 +72,12 @@ def run(config):
       guidance_scale=config.guidance_scale,
       slg_layers=slg_layers,
       slg_start=slg_start,
-      slg_end=slg_end
+      slg_end=slg_end,
+      enable_teacache=enable_teacache,
+      teacache_thresh=teacache_thresh,
+      use_ret_steps=use_ret_steps,
+      ret_steps=ret_steps,
+      cutoff_steps=cutoff_steps,
     )
   print("generation time: ", (time.perf_counter() - s0))
   for i in range(len(videos)):
