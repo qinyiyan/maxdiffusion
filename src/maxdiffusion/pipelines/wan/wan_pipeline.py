@@ -144,6 +144,7 @@ class WanPipeline:
       devices_array: np.array,
       mesh: Mesh,
       config: HyperParameters,
+      teacache_coefficients: Optional[jnp.array] = None,
   ):
     self.tokenizer = tokenizer
     self.text_encoder = text_encoder
@@ -155,6 +156,7 @@ class WanPipeline:
     self.devices_array = devices_array
     self.mesh = mesh
     self.config = config
+    self.teacache_coefficients = teacache_coefficients
 
     self.vae_scale_factor_temporal = 2 ** sum(self.vae.temperal_downsample) if getattr(self, "vae", None) else 4
     self.vae_scale_factor_spatial = 2 ** len(self.vae.temperal_downsample) if getattr(self, "vae", None) else 8
@@ -229,6 +231,9 @@ class WanPipeline:
     scheduler = None
     scheduler_state = None
     text_encoder = None
+
+    teacache_coefficients=config.teacache_coefficients
+
     if not vae_only:
       with mesh:
         transformer = cls.load_transformer(devices_array=devices_array, mesh=mesh, rngs=rngs, config=config)
@@ -251,7 +256,8 @@ class WanPipeline:
         scheduler_state=scheduler_state,
         devices_array=devices_array,
         mesh=mesh,
-        config=config,
+        config=config, 
+        teacache_coefficients=teacache_coefficients
     )
 
   def _get_t5_prompt_embeds(
@@ -360,6 +366,12 @@ class WanPipeline:
       slg_layers: List[int] = None,
       slg_start: float = 0.0,
       slg_end: float = 1.0,
+      # TeaCache parameters
+      enable_teacache: bool = False,
+      teacache_thresh: float = 0.0,
+      use_ret_steps: bool = False,
+      ret_steps: int = 0,
+      cutoff_steps: int = 0,    
   ):
     if not vae_only:
       if num_frames % self.vae_scale_factor_temporal != 1:
@@ -419,6 +431,12 @@ class WanPipeline:
           slg_start=slg_start,
           slg_end=slg_end,
           num_transformer_layers=self.transformer.config.num_layers,
+          enable_teacache=enable_teacache,
+          teacache_thresh=teacache_thresh,
+          use_ret_steps=use_ret_steps,
+          ret_steps=ret_steps,
+          cutoff_steps=cutoff_steps,
+          teacache_coefficients=self.teacache_coefficients,
       )
 
       with self.mesh, nn_partitioning.axis_rules(self.config.logical_axis_rules):
@@ -466,37 +484,145 @@ def run_inference(
     slg_layers: List[int] = None,
     slg_start: float = 0.0,
     slg_end: float = 1.0,
-):
-  do_classifier_free_guidance = guidance_scale > 1.0
-  for step in range(num_inference_steps):
-    slg_mask = jnp.zeros(num_transformer_layers, dtype=jnp.bool_)
-    if slg_layers and int(slg_start * num_inference_steps) <= step < int(slg_end * num_inference_steps):
-      slg_mask = slg_mask.at[jnp.array(slg_layers)].set(True)
-    t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
-    timestep = jnp.broadcast_to(t, latents.shape[0])
+    # TeaCache parameters
+    enable_teacache: bool = False,
+    teacache_thresh: float = 0.0, # Now acts as a global multiplier for coefficients or fallback
+    use_ret_steps: bool = False,
+    ret_steps: int = 0, # Max skip steps
+    cutoff_steps: int = 0, # How many steps to apply the caching, corresponds to num_steps in PT
+    teacache_coefficients: Optional[jnp.array] = None,
+    ):
+      do_classifier_free_guidance = guidance_scale > 1.0
 
-    noise_pred = transformer_forward_pass(
-        graphdef,
-        sharded_state,
-        rest_of_state,
-        latents,
-        timestep,
-        prompt_embeds,
-        is_uncond=jnp.array(False, dtype=jnp.bool_),
-        slg_mask=slg_mask,
-    )
+      # Initialize TeaCache state variables outside the loop
+      # These variables will be updated directly within the loop
+      previous_e0_even = jnp.zeros_like(latents) # Initialize with appropriate shape/dtype
+      previous_e0_odd = jnp.zeros_like(latents)
+      previous_residual_even = jnp.zeros_like(latents)
+      previous_residual_odd = jnp.zeros_like(latents)
+      accumulated_rel_l1_distance_even = 0.0
+      accumulated_rel_l1_distance_odd = 0.0
+      cnt = 0 # Counter for the steps, equivalent to self.cnt
+      is_even = True # Track even/odd step for TeaCache
 
-    if do_classifier_free_guidance:
-      noise_uncond = transformer_forward_pass(
-          graphdef,
-          sharded_state,
-          rest_of_state,
-          latents,
-          timestep,
-          negative_prompt_embeds,
-          is_uncond=jnp.array(True, dtype=jnp.bool_),
-          slg_mask=slg_mask,
-      )
-      noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
-    latents, scheduler_state = scheduler.step(scheduler_state, noise_pred, t, latents).to_tuple()
-  return latents
+
+      for step in range(num_inference_steps):
+
+        t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
+        timestep = jnp.broadcast_to(t, latents.shape[0])
+
+        slg_mask = jnp.zeros(num_transformer_layers, dtype=jnp.bool_)
+        if slg_layers and int(slg_start * num_inference_steps) <= step < int(slg_end * num_inference_steps):
+          slg_mask = slg_mask.at[jnp.array(slg_layers)].set(True)
+
+
+        # `noise_pred_to_use` will store the final noise prediction (e) for the scheduler step.
+        noise_pred_to_use = None 
+        should_calc_current_step = True # Flag to determine if we perform new model inference for TeaCache decision
+
+        if enable_teacache:
+            # TeaCache decision phase: always calculate the *current* noise predictions
+            # to decide if we should use them or a cached version.
+
+            # Calculate conditional noise prediction
+            noise_pred_cond = transformer_forward_pass(
+                graphdef, sharded_state, rest_of_state,
+                latents, timestep, prompt_embeds,
+                is_uncond=jnp.array(False, dtype=jnp.bool_),
+                slg_mask=slg_mask
+            )
+
+            if do_classifier_free_guidance:
+                # Calculate unconditional noise prediction
+                noise_pred_uncond = transformer_forward_pass(
+                    graphdef, sharded_state, rest_of_state,
+                    latents, timestep, negative_prompt_embeds,
+                    is_uncond=jnp.array(True, dtype=jnp.bool_),
+                    slg_mask=slg_mask
+                )
+                # Combine for CFG to get the `e` for TeaCache decision
+                noise_pred_for_decision = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred_for_decision = noise_pred_cond # No CFG, so conditional is the decision noise
+
+            # Derive e0 from the current `e` (noise_pred_for_decision) for comparison
+            # e0_for_decision = scheduler.get_original_samples(scheduler_state, noise_pred_for_decision, t, latents)
+            alpha_t_current = scheduler_state.alpha_t[step]
+            sigma_t_current = scheduler_state.sigma_t[step]
+            e0_for_decision = (latents - sigma_t_current * noise_pred_for_decision) / alpha_t_current
+
+            modulated_inp = e0_for_decision if use_ret_steps else noise_pred_for_decision
+
+            # --- TeaCache Decision Logic ---
+            if cnt % 2 == 0:  # even -> condition
+                is_even = True
+                if cnt < ret_steps or cnt >= cutoff_steps:
+                    should_calc_current_step = True
+                    accumulated_rel_l1_distance_even = 0.0
+                else:
+                    rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_even).mean() / jnp.abs(previous_e0_even).mean())
+                    rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
+                    accumulated_rel_l1_distance_even += rescale_val
+
+                    if accumulated_rel_l1_distance_even < teacache_thresh:
+                        should_calc_current_step = False
+                    else:
+                        should_calc_current_step = True
+                        accumulated_rel_l1_distance_even = 0.0
+                previous_e0_even = modulated_inp # Update previous_e0_even for next comparison
+
+                # Select which noise_pred to use for the scheduler step
+                if not should_calc_current_step:
+                    noise_pred_to_use = previous_noise_pred_even # Use cached noise_pred
+                else:
+                    noise_pred_to_use = noise_pred_for_decision # Use the freshly computed noise_pred
+                    previous_noise_pred_even = noise_pred_to_use # Store it for future caching
+            else:  # odd -> uncondition
+                is_even = False
+                if cnt < ret_steps or cnt >= cutoff_steps:
+                    should_calc_current_step = True
+                    accumulated_rel_l1_distance_odd = 0.0
+                else:
+                    rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_odd).mean() / jnp.abs(previous_e0_odd).mean())
+                    rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
+                    accumulated_rel_l1_distance_odd += rescale_val
+
+                    if accumulated_rel_l1_distance_odd < teacache_thresh:
+                        should_calc_current_step = False
+                    else:
+                        should_calc_current_step = True
+                        accumulated_rel_l1_distance_odd = 0.0
+                previous_e0_odd = modulated_inp # Update previous_e0_odd for next comparison
+
+                # Select which noise_pred to use for the scheduler step
+                if not should_calc_current_step:
+                    noise_pred_to_use = previous_noise_pred_odd # Use cached noise_pred
+                else:
+                    noise_pred_to_use = noise_pred_for_decision # Use the freshly computed noise_pred
+                    previous_noise_pred_odd = noise_pred_to_use # Store it for future caching
+        else: # If TeaCache is disabled, follow the original CFG pattern
+            noise_pred_to_use = transformer_forward_pass(
+                graphdef, sharded_state, rest_of_state,
+                latents, timestep, prompt_embeds,
+                is_uncond=jnp.array(False, dtype=jnp.bool_),
+                slg_mask=slg_mask
+            )
+
+            if do_classifier_free_guidance:
+                noise_uncond = transformer_forward_pass(
+                    graphdef, sharded_state, rest_of_state,
+                    latents, timestep, negative_prompt_embeds,
+                    is_uncond=jnp.array(True, dtype=jnp.bool_),
+                    slg_mask=slg_mask
+                )
+                noise_pred_to_use = noise_uncond + guidance_scale * (noise_pred_to_use - noise_uncond)
+
+        # Scheduler step always uses the determined `noise_pred_to_use`
+        latents, scheduler_state = scheduler.step(scheduler_state, noise_pred_to_use, t, latents).to_tuple()
+
+        # Increment counter and reset if necessary
+        cnt += 1
+        if cnt >= num_inference_steps:
+            cnt = 0
+
+      return latents

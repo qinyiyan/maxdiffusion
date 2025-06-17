@@ -219,6 +219,19 @@ flow_shift: 3.0
 slg_layers: [9]
 slg_start: 0.2
 slg_end: 1.0
+
+
+
+
+# TeaCache parameters
+enable_teacache: True # Set to True to enable TeaCache optimization
+teacache_thresh: 1.0 # Global multiplier for the dynamic threshold (experiment with values like 0.8-1.2)
+use_ret_steps: False # If True, use a simpler "return steps" strategy instead of L1 comparison
+ret_steps: 1 # Number of steps to reuse cache when use_ret_steps is True (e.g., 5 for aggressive, 1 for less aggressive)
+cutoff_steps: 5 # Number of initial diffusion steps to skip TeaCache (e.g., 2 for Wan)
+teacache_coefficients: [-5784.54975374,  5449.50911966, -1811.16591783,   256.27178429, -13.02252404] # '1.3B' or '14B' to load model-specific coefficients. Set to None to use static teacache_thresh.
+
+
 # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
 guidance_rescale: 0.0
 num_inference_steps: 30
