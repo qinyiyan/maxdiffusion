@@ -245,7 +245,7 @@ class WanPipeline:
     scheduler=None
     scheduler_state=None
     text_encoder=None
-    teacache_coefficients=None # Initialize teacache_coefficients
+    teacache_coefficients=config.teacache_coefficients # Initialize teacache_coefficients
 
     if not vae_only:
       with mesh:
@@ -589,8 +589,8 @@ def run_inference(
                   should_calc_current_step = True
                   accumulated_rel_l1_distance_even = 0.0
               else:
-                  rel_l1_dist_val = ((modulated_inp - previous_e0_even).abs().mean() / previous_e0_even.abs().mean())
-                  rescale_val = polyval_jax(teacache_coefficients, rel_l1_dist_val)
+                  rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_even).mean() / jnp.abs(previous_e0_even).mean())
+                  rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
                   accumulated_rel_l1_distance_even += rescale_val
 
                   if accumulated_rel_l1_distance_even < teacache_thresh:
@@ -612,8 +612,8 @@ def run_inference(
                   should_calc_current_step = True
                   accumulated_rel_l1_distance_odd = 0.0
               else:
-                  rel_l1_dist_val = ((modulated_inp - previous_e0_odd).abs().mean() / previous_e0_odd.abs().mean())
-                  rescale_val = polyval_jax(teacache_coefficients, rel_l1_dist_val)
+                  rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_odd).mean() / jnp.abs(previous_e0_odd).mean())
+                  rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
                   accumulated_rel_l1_distance_odd += rescale_val
 
                   if accumulated_rel_l1_distance_odd < teacache_thresh:
