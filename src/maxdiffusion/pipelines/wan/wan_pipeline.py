@@ -507,6 +507,37 @@ def run_inference(
 
 
       for step in range(num_inference_steps):
+        print(f"Step {step}/{num_inference_steps}")
+
+        if step == 0:
+          # print calculate flops for transformer_forward_pass 
+          max_logging.log("Calculating FLOPs for transformer_forward_pass...")
+          jit_fn = jit(transformer_forward_pass)
+
+          lowered = jit_fn.lower(
+            graphdef, sharded_state, rest_of_state,
+                latents, timestep, prompt_embeds,
+                is_uncond=jnp.array(False, dtype=jnp.bool_),
+                slg_mask=slg_mask
+          )
+          cost_analysis = lowered.cost_analysis()
+
+          print("\n--- XLA Cost Analysis Results ---")
+          print(f"Full Cost Analysis Dict: {cost_analysis}")
+
+          total_flops = cost_analysis.get('flops', 0)
+          total_bytes_accessed = cost_analysis.get('bytes accessed', 0)
+
+          print(f"\nEstimated Total FLOPs: {total_flops / 1e9:.2f} GFLOPs")
+          print(f"Estimated Total Bytes Accessed: {total_bytes_accessed / 1e9:.2f} GB")
+
+          if total_bytes_accessed > 0:
+              arithmetic_intensity = total_flops / total_bytes_accessed
+              print(f"Estimated Arithmetic Intensity (AI): {arithmetic_intensity:.2f} FLOPs/Byte")
+          else:
+              print("Total Bytes Accessed is zero. Cannot calculate AI.")
+
+      
 
         t = jnp.array(scheduler_state.timesteps, dtype=jnp.int32)[step]
         timestep = jnp.broadcast_to(t, latents.shape[0])
@@ -561,7 +592,7 @@ def run_inference(
                     accumulated_rel_l1_distance_even = 0.0
                 else:
                     rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_even).mean() / jnp.abs(previous_e0_even).mean())
-                    rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
+                    rescale_val = jnp.polyval(jnp.array(teacache_coefficients), rel_l1_dist_val)
                     accumulated_rel_l1_distance_even += rescale_val
 
                     if accumulated_rel_l1_distance_even < teacache_thresh:
@@ -571,6 +602,7 @@ def run_inference(
                         accumulated_rel_l1_distance_even = 0.0
                 previous_e0_even = modulated_inp # Update previous_e0_even for next comparison
 
+                print(f"{should_calc_current_step=}, {is_even=}")
                 # Select which noise_pred to use for the scheduler step
                 if not should_calc_current_step:
                     noise_pred_to_use = previous_noise_pred_even # Use cached noise_pred
@@ -584,7 +616,7 @@ def run_inference(
                     accumulated_rel_l1_distance_odd = 0.0
                 else:
                     rel_l1_dist_val = (jnp.abs(modulated_inp - previous_e0_odd).mean() / jnp.abs(previous_e0_odd).mean())
-                    rescale_val = jnp.polyval(teacache_coefficients, rel_l1_dist_val)
+                    rescale_val = jnp.polyval(jnp.array(teacache_coefficients), rel_l1_dist_val)
                     accumulated_rel_l1_distance_odd += rescale_val
 
                     if accumulated_rel_l1_distance_odd < teacache_thresh:
@@ -593,7 +625,7 @@ def run_inference(
                         should_calc_current_step = True
                         accumulated_rel_l1_distance_odd = 0.0
                 previous_e0_odd = modulated_inp # Update previous_e0_odd for next comparison
-
+                print(f"{should_calc_current_step=}, {is_even=}")
                 # Select which noise_pred to use for the scheduler step
                 if not should_calc_current_step:
                     noise_pred_to_use = previous_noise_pred_odd # Use cached noise_pred
